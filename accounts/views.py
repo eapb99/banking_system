@@ -1,8 +1,6 @@
-import random
 from decimal import Decimal
-
+import json
 from django.contrib.auth import authenticate
-from django.contrib.auth.models import User
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
@@ -10,10 +8,8 @@ from rest_framework.decorators import permission_classes, api_view
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.views import TokenObtainPairView
-
+from django.utils.crypto import get_random_string
 from .models import Token, CuentaBancaria, Contacto, Transferencia
-import json
-
 from .serializers import CustomTokenObtainPairSerializer
 
 
@@ -43,64 +39,25 @@ def login_view(request):
         return JsonResponse({'mensaje': 'Método no permitido'}, status=405)
 
 
-def generar_token(request, usuario_id):
-    try:
-        usuario = User.objects.get(id=usuario_id)
-    except User.DoesNotExist:
-        return JsonResponse({'error': 'User no encontrado'}, status=404)
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def generar_token(request):
+    usuario_actual = request.user
 
-    # Verificar si ya existe un token válido
-    token = Token.objects.filter(cliente=usuario, es_valido=True).last()
+    token_existente = Token.objects.filter(cliente=usuario_actual, es_valido=True).last()
 
-    if token and not token.has_expired():
-        # Si el token aún es válido, devolverlo con el tiempo restante
-        tiempo_restante = 60 - (timezone.now() - token.generado_en).seconds
-        return JsonResponse({'token': token.token, 'tiempo_restante': tiempo_restante})
+    if token_existente:
+        if token_existente.has_expired():
+            token_existente.es_valido = False
+            token_existente.save()
+        else:
+            tiempo_restante = 60 - (timezone.now() - token_existente.generado_en).seconds
+            return Response({'token': token_existente.token, 'tiempo_restante': tiempo_restante})
 
-    # Generar un nuevo token
-    nuevo_token_valor = str(random.randint(100000, 999999))
-    nuevo_token = Token.objects.create(cliente=usuario, token=nuevo_token_valor)
-    return JsonResponse({'token': nuevo_token.token, 'tiempo_restante': 60})
+    nuevo_token_valor = get_random_string(6, allowed_chars='0123456789')  # Generar token aleatorio de 6 dígitos
+    nuevo_token = Token.objects.create(cliente=usuario_actual, token=nuevo_token_valor, es_valido=True)
+    return Response({'token': nuevo_token.token, 'tiempo_restante': 60})
 
-
-@csrf_exempt
-def usar_token(request):
-    if request.method == 'POST':
-        try:
-            body_unicode = request.body.decode('utf-8')
-            body = json.loads(body_unicode)
-            usuario_id = body.get('usuario_id')
-            token_valor = body.get('token')
-
-            if not usuario_id or not token_valor:
-                return JsonResponse({'error': 'usuario_id y token son requeridos'}, status=400)
-
-            # Buscar el usuario
-            try:
-                usuario = User.objects.get(id=usuario_id)
-            except User.DoesNotExist:
-                return JsonResponse({'error': 'User no encontrado'}, status=404)
-
-            # Buscar el token
-            try:
-                token = Token.objects.get(cliente=usuario, token=token_valor, es_valido=True)
-            except Token.DoesNotExist:
-                return JsonResponse({'error': 'Token no encontrado o ya no es válido'}, status=404)
-
-            # Verificar si el token ha expirado
-            if token.has_expired():
-                token.es_valido = False
-                token.save()
-                return JsonResponse({'error': 'Token ha expirado'}, status=400)
-
-            # Marcar el token como usado
-            token.marcar_usado()
-            return JsonResponse({'mensaje': 'Token utilizado correctamente'})
-
-        except json.JSONDecodeError:
-            return JsonResponse({'error': 'Error al procesar JSON'}, status=400)
-    else:
-        return JsonResponse({'error': 'Método no permitido. Usa POST.'}, status=405)
 
 
 @api_view(['GET'])
@@ -109,7 +66,6 @@ def obtener_cuenta_origen(request):
     usuario_actual = request.user
     cuentas = CuentaBancaria.objects.filter(usuario=usuario_actual)
     lista_cuentas = [{'numero': cuenta.numero, 'tipo': cuenta.tipo, 'saldo': cuenta.saldo} for cuenta in cuentas]
-    print(lista_cuentas)
     return JsonResponse({'cuentas': lista_cuentas})
 
 
@@ -118,59 +74,67 @@ def obtener_cuenta_origen(request):
 def obtener_tokens_cliente(request):
     user = request.user
     tokens = Token.objects.filter(cliente=user)
-    lista_tokens = [{'token': t.token, 'generado_en': t.generado_en, 'usado_en': t.usado_en, 'es_valido': t.es_valido}
-                    for t in tokens]
+
+    # Verificar cada token si sigue siendo válido
+    lista_tokens = []
+    for t in tokens:
+        # Calcular la diferencia en segundos entre el tiempo actual y el tiempo de generación
+        tiempo_actual = timezone.now()
+        tiempo_generado = t.generado_en
+        tiempo_diferencia = (tiempo_actual - tiempo_generado).total_seconds()
+
+        # Si han pasado más de 60 segundos desde la generación, marcar el token como no válido
+        if tiempo_diferencia > 60 and t.es_valido:
+            t.es_valido = False
+            t.save()
+
+        # Añadir el token a la lista de respuesta
+        lista_tokens.append({
+            'token': t.token,
+            'generado_en': t.generado_en.strftime("%m/%d/%Y, %H:%M:%S"),
+            'usado_en': t.usado_en.strftime("%m/%d/%Y, %H:%M:%S") if t.usado_en else None,
+            'es_valido': t.es_valido
+        })
 
     return JsonResponse({'tokens': lista_tokens})
 
-
-def obtener_contactos(request, usuario_id):
-    try:
-        usuario = User.objects.get(id=usuario_id)
-    except User.DoesNotExist:
-        return JsonResponse({'error': 'User no encontrado'}, status=404)
-
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def obtener_contactos(request):
+    usuario = request.user
     contactos = Contacto.objects.filter(usuario=usuario)
     lista_contactos = [{'nombre': contacto.cuenta_bancaria.usuario.username, 'numero': contacto.cuenta_bancaria.numero}
                        for contacto in contactos]
-
     return JsonResponse({'contactos': lista_contactos})
 
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])  # El usuario debe estar autenticado
+@permission_classes([IsAuthenticated])
 def realizar_transferencia(request):
-    # Obtener el usuario autenticado
     usuario_actual = request.user
 
-    # Datos que vienen en el cuerpo de la solicitud
     cuenta_origen_id = request.data.get('cuenta_origen')
     cuenta_destino_id = request.data.get('cuenta_destino')
     monto = Decimal(request.data.get('monto'))
     motivo = request.data.get('motivo', '')
     token_valor = request.data.get('token')
 
-    # Verificar que la cuenta de origen pertenezca al usuario autenticado
     try:
-        cuenta_origen = CuentaBancaria.objects.get(id=cuenta_origen_id, usuario=usuario_actual)
+        cuenta_origen = CuentaBancaria.objects.get(numero=cuenta_origen_id, usuario=usuario_actual)
     except CuentaBancaria.DoesNotExist:
         return Response({'error': 'La cuenta de origen no existe o no pertenece al usuario'}, status=404)
 
-    # Verificar que la cuenta de destino exista
     try:
-        cuenta_destino = CuentaBancaria.objects.get(id=cuenta_destino_id)
+        cuenta_destino = CuentaBancaria.objects.get(numero=cuenta_destino_id)
     except CuentaBancaria.DoesNotExist:
         return Response({'error': 'La cuenta de destino no existe'}, status=404)
 
-    # Verificar que el token de seguridad sea válido
     try:
         token = Token.objects.get(cliente=usuario_actual, token=token_valor, es_valido=True)
     except Token.DoesNotExist:
         return Response({'error': 'El token no es válido o ha expirado'}, status=400)
 
-    # Verificar si el token ha expirado
     if token.has_expired():
-        # Si el token ha expirado, marcarlo como inválido y generar uno nuevo
         token.es_valido = False
         token.save()
 
@@ -199,7 +163,6 @@ def realizar_transferencia(request):
         motivo=motivo
     )
 
-    # Marcar el token como usado
     token.es_valido = False
     token.usado_en = timezone.now()
     token.save()

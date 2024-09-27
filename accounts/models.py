@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 from django.utils import timezone
 
 
-
 class Token(models.Model):
     cliente = models.ForeignKey(User, on_delete=models.CASCADE)
     token = models.CharField(max_length=6)
